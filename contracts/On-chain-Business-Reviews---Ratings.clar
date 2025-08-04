@@ -573,3 +573,169 @@
 (define-read-only (get-token-balance (account principal))
     (ft-get-balance review-token account)
 )
+
+(define-constant ERR-ALREADY-RESPONDED (err u106))
+(define-constant ERR-RESPONSE-TOO-LONG (err u107))
+(define-constant RESPONSE-COOLDOWN u144)
+(define-constant MAX-RESPONSE-LENGTH u300)
+
+(define-data-var response-counter uint u0)
+
+(define-map BusinessResponses
+    { response-id: uint }
+    {
+        review-id: uint,
+        business-id: uint,
+        responder: principal,
+        response-text: (string-ascii 300),
+        timestamp: uint,
+        is-public: bool,
+    }
+)
+
+(define-map ReviewResponseMap
+    { review-id: uint }
+    { response-id: uint }
+)
+
+(define-map ResponseMetrics
+    { business-id: uint }
+    {
+        total-responses: uint,
+        average-response-time: uint,
+        last-response-block: uint,
+    }
+)
+
+(define-public (respond-to-review
+        (review-id uint)
+        (response-text (string-ascii 300))
+        (is-public bool)
+    )
+    (let (
+            (review (unwrap! (map-get? Reviews { review-id: review-id })
+                ERR-REVIEW-NOT-FOUND
+            ))
+            (business-id (get business-id review))
+            (business (unwrap! (map-get? Businesses { business-id: business-id })
+                ERR-BUSINESS-NOT-FOUND
+            ))
+            (new-response-id (+ (var-get response-counter) u1))
+        )
+        (asserts! (is-eq tx-sender (get owner business)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= (len response-text) MAX-RESPONSE-LENGTH)
+            ERR-RESPONSE-TOO-LONG
+        )
+        (asserts! (is-none (map-get? ReviewResponseMap { review-id: review-id }))
+            ERR-ALREADY-RESPONDED
+        )
+        (let (
+                (response-time (- burn-block-height (get timestamp review)))
+                (current-metrics (default-to {
+                    total-responses: u0,
+                    average-response-time: u0,
+                    last-response-block: u0,
+                }
+                    (map-get? ResponseMetrics { business-id: business-id })
+                ))
+            )
+            (map-set BusinessResponses { response-id: new-response-id } {
+                review-id: review-id,
+                business-id: business-id,
+                responder: tx-sender,
+                response-text: response-text,
+                timestamp: burn-block-height,
+                is-public: is-public,
+            })
+            (map-set ReviewResponseMap { review-id: review-id } { response-id: new-response-id })
+            (map-set ResponseMetrics { business-id: business-id } {
+                total-responses: (+ (get total-responses current-metrics) u1),
+                average-response-time: (calculate-avg-response-time
+                    (get total-responses current-metrics)
+                    (get average-response-time current-metrics)
+                    response-time
+                ),
+                last-response-block: burn-block-height,
+            })
+            (var-set response-counter new-response-id)
+            (ok new-response-id)
+        )
+    )
+)
+
+(define-public (update-response
+        (response-id uint)
+        (new-response-text (string-ascii 300))
+    )
+    (let ((response (unwrap! (map-get? BusinessResponses { response-id: response-id })
+            ERR-REVIEW-NOT-FOUND
+        )))
+        (asserts! (is-eq tx-sender (get responder response)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= (len new-response-text) MAX-RESPONSE-LENGTH)
+            ERR-RESPONSE-TOO-LONG
+        )
+        (asserts!
+            (>= (- burn-block-height (get timestamp response)) RESPONSE-COOLDOWN)
+            ERR-NOT-AUTHORIZED
+        )
+        (map-set BusinessResponses { response-id: response-id }
+            (merge response {
+                response-text: new-response-text,
+                timestamp: burn-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-private (calculate-avg-response-time
+        (total-responses uint)
+        (current-avg uint)
+        (new-response-time uint)
+    )
+    (if (is-eq total-responses u0)
+        new-response-time
+        (/ (+ (* current-avg total-responses) new-response-time)
+            (+ total-responses u1)
+        )
+    )
+)
+
+(define-read-only (get-response-to-review (review-id uint))
+    (match (map-get? ReviewResponseMap { review-id: review-id })
+        response-map (map-get? BusinessResponses { response-id: (get response-id response-map) })
+        none
+    )
+)
+
+(define-read-only (get-response-details (response-id uint))
+    (map-get? BusinessResponses { response-id: response-id })
+)
+
+(define-read-only (get-business-response-metrics (business-id uint))
+    (map-get? ResponseMetrics { business-id: business-id })
+)
+
+(define-read-only (get-business-responsiveness-score (business-id uint))
+    (match (map-get? ResponseMetrics { business-id: business-id })
+        metrics (let (
+                (business-data (unwrap-panic (map-get? Businesses { business-id: business-id })))
+                (total-ratings (get total-ratings business-data))
+                (response-rate (if (> (get total-responses metrics) u0)
+                    (/ (* (get total-responses metrics) u100)
+                        (if (> total-ratings u0)
+                            total-ratings
+                            u1
+                        ))
+                    u0
+                ))
+                (speed-score (if (> (get average-response-time metrics) u0)
+                    (/ u14400 (get average-response-time metrics))
+                    u0
+                ))
+            )
+            (some (/ (+ response-rate speed-score) u2))
+        )
+        none
+    )
+)
