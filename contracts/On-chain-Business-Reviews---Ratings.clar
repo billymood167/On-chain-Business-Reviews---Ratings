@@ -739,3 +739,221 @@
         none
     )
 )
+
+(define-constant ERR-ALREADY-VOTED (err u108))
+(define-constant ERR-SELF-VOTE (err u109))
+(define-constant HELPFULNESS-REWARD u3)
+(define-constant HELPFUL-VOTE-THRESHOLD u5)
+
+(define-map ReviewHelpfulness
+    { review-id: uint }
+    {
+        helpful-votes: uint,
+        unhelpful-votes: uint,
+        total-votes: uint,
+        helpfulness-score: uint,
+    }
+)
+
+(define-map UserVotes
+    {
+        voter: principal,
+        review-id: uint,
+    }
+    {
+        vote-type: bool,
+        timestamp: uint,
+    }
+)
+
+(define-map ReviewerHelpfulnessStats
+    { reviewer: principal }
+    {
+        reviews-with-helpful-votes: uint,
+        total-helpful-votes-received: uint,
+        helpfulness-ranking: uint,
+    }
+)
+
+(define-public (vote-on-review-helpfulness
+        (review-id uint)
+        (is-helpful bool)
+    )
+    (let (
+            (review (unwrap! (map-get? Reviews { review-id: review-id })
+                ERR-REVIEW-NOT-FOUND
+            ))
+            (reviewer (get reviewer review))
+            (current-helpfulness (default-to {
+                helpful-votes: u0,
+                unhelpful-votes: u0,
+                total-votes: u0,
+                helpfulness-score: u0,
+            }
+                (map-get? ReviewHelpfulness { review-id: review-id })
+            ))
+        )
+        (asserts! (not (is-eq tx-sender reviewer)) ERR-SELF-VOTE)
+        (asserts!
+            (is-none (map-get? UserVotes {
+                voter: tx-sender,
+                review-id: review-id,
+            }))
+            ERR-ALREADY-VOTED
+        )
+        (let (
+                (new-helpful-votes (if is-helpful
+                    (+ (get helpful-votes current-helpfulness) u1)
+                    (get helpful-votes current-helpfulness)
+                ))
+                (new-unhelpful-votes (if is-helpful
+                    (get unhelpful-votes current-helpfulness)
+                    (+ (get unhelpful-votes current-helpfulness) u1)
+                ))
+                (new-total-votes (+ (get total-votes current-helpfulness) u1))
+                (new-helpfulness-score (calculate-helpfulness-score new-helpful-votes new-total-votes))
+            )
+            (map-set ReviewHelpfulness { review-id: review-id } {
+                helpful-votes: new-helpful-votes,
+                unhelpful-votes: new-unhelpful-votes,
+                total-votes: new-total-votes,
+                helpfulness-score: new-helpfulness-score,
+            })
+            (map-set UserVotes {
+                voter: tx-sender,
+                review-id: review-id,
+            } {
+                vote-type: is-helpful,
+                timestamp: burn-block-height,
+            })
+            (if is-helpful
+                (unwrap-panic (update-reviewer-helpfulness-stats reviewer))
+                true
+            )
+            (if (and is-helpful (>= new-helpful-votes HELPFUL-VOTE-THRESHOLD))
+                (unwrap-panic (as-contract (ft-transfer? review-token HELPFULNESS-REWARD tx-sender reviewer)))
+                false
+            )
+            (ok new-helpfulness-score)
+        )
+    )
+)
+
+(define-public (change-helpfulness-vote
+        (review-id uint)
+        (new-is-helpful bool)
+    )
+    (let (
+            (existing-vote (unwrap!
+                (map-get? UserVotes {
+                    voter: tx-sender,
+                    review-id: review-id,
+                })
+                ERR-REVIEW-NOT-FOUND
+            ))
+            (current-helpfulness (unwrap! (map-get? ReviewHelpfulness { review-id: review-id })
+                ERR-REVIEW-NOT-FOUND
+            ))
+            (old-vote-type (get vote-type existing-vote))
+        )
+        (asserts! (not (is-eq old-vote-type new-is-helpful)) ERR-ALREADY-VOTED)
+        (let (
+                (helpful-adjustment (if new-is-helpful
+                    u1
+                    (- u0 u1)
+                ))
+                (unhelpful-adjustment (if new-is-helpful
+                    (- u0 u1)
+                    u1
+                ))
+                (new-helpful-votes (+ (get helpful-votes current-helpfulness) helpful-adjustment))
+                (new-unhelpful-votes (+ (get unhelpful-votes current-helpfulness) unhelpful-adjustment))
+                (new-helpfulness-score (calculate-helpfulness-score new-helpful-votes
+                    (get total-votes current-helpfulness)
+                ))
+            )
+            (map-set ReviewHelpfulness { review-id: review-id } {
+                helpful-votes: new-helpful-votes,
+                unhelpful-votes: new-unhelpful-votes,
+                total-votes: (get total-votes current-helpfulness),
+                helpfulness-score: new-helpfulness-score,
+            })
+            (map-set UserVotes {
+                voter: tx-sender,
+                review-id: review-id,
+            } {
+                vote-type: new-is-helpful,
+                timestamp: burn-block-height,
+            })
+            (ok new-helpfulness-score)
+        )
+    )
+)
+
+(define-private (calculate-helpfulness-score
+        (helpful-votes uint)
+        (total-votes uint)
+    )
+    (if (> total-votes u0)
+        (/ (* helpful-votes u100) total-votes)
+        u50
+    )
+)
+
+(define-private (update-reviewer-helpfulness-stats (reviewer principal))
+    (let (
+            (current-stats (default-to {
+                reviews-with-helpful-votes: u0,
+                total-helpful-votes-received: u0,
+                helpfulness-ranking: u0,
+            }
+                (map-get? ReviewerHelpfulnessStats { reviewer: reviewer })
+            ))
+            (new-total-votes (+ (get total-helpful-votes-received current-stats) u1))
+        )
+        (map-set ReviewerHelpfulnessStats { reviewer: reviewer } {
+            reviews-with-helpful-votes: (+ (get reviews-with-helpful-votes current-stats) u1),
+            total-helpful-votes-received: new-total-votes,
+            helpfulness-ranking: (calculate-helpfulness-ranking new-total-votes),
+        })
+        (ok true)
+    )
+)
+
+(define-private (calculate-helpfulness-ranking (total-helpful-votes uint))
+    (if (>= total-helpful-votes u50)
+        u5
+        (if (>= total-helpful-votes u25)
+            u4
+            (if (>= total-helpful-votes u10)
+                u3
+                (if (>= total-helpful-votes u5)
+                    u2
+                    u1
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-review-helpfulness (review-id uint))
+    (map-get? ReviewHelpfulness { review-id: review-id })
+)
+
+(define-read-only (get-user-vote
+        (voter principal)
+        (review-id uint)
+    )
+    (map-get? UserVotes {
+        voter: voter,
+        review-id: review-id,
+    })
+)
+
+(define-read-only (get-reviewer-helpfulness-stats (reviewer principal))
+    (map-get? ReviewerHelpfulnessStats { reviewer: reviewer })
+)
+
+(define-read-only (get-top-helpful-reviews (business-id uint))
+    (list)
+)
