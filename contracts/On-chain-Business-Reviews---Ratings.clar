@@ -957,3 +957,203 @@
 (define-read-only (get-top-helpful-reviews (business-id uint))
     (list)
 )
+
+(define-constant ERR-UPDATE-TOO-SOON (err u110))
+(define-constant ERR-MAX-UPDATES-REACHED (err u111))
+(define-constant REVIEW-UPDATE-COOLDOWN u720)
+(define-constant MAX-REVIEW-UPDATES u3)
+(define-constant UPDATE-REWARD u2)
+
+(define-map ReviewUpdateHistory
+    { review-id: uint }
+    {
+        update-count: uint,
+        last-update-block: uint,
+        original-rating: uint,
+        previous-rating: uint,
+    }
+)
+
+(define-map ReviewAmendments
+    {
+        review-id: uint,
+        amendment-index: uint,
+    }
+    {
+        old-rating: uint,
+        new-rating: uint,
+        old-text: (string-ascii 500),
+        new-text: (string-ascii 500),
+        timestamp: uint,
+    }
+)
+
+(define-public (update-review
+        (review-id uint)
+        (new-rating uint)
+        (new-review-text (string-ascii 500))
+    )
+    (let (
+            (review (unwrap! (map-get? Reviews { review-id: review-id })
+                ERR-REVIEW-NOT-FOUND
+            ))
+            (update-history (default-to {
+                update-count: u0,
+                last-update-block: u0,
+                original-rating: (get rating review),
+                previous-rating: (get rating review),
+            }
+                (map-get? ReviewUpdateHistory { review-id: review-id })
+            ))
+        )
+        (asserts! (is-eq tx-sender (get reviewer review)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= new-rating u1) (<= new-rating u5)) ERR-INVALID-RATING)
+        (asserts! (< (get update-count update-history) MAX-REVIEW-UPDATES)
+            ERR-MAX-UPDATES-REACHED
+        )
+        (asserts!
+            (>= (- burn-block-height (get last-update-block update-history))
+                REVIEW-UPDATE-COOLDOWN
+            )
+            ERR-UPDATE-TOO-SOON
+        )
+        (let (
+                (business-id (get business-id review))
+                (old-rating (get rating review))
+                (old-text (get review-text review))
+                (new-update-count (+ (get update-count update-history) u1))
+            )
+            (map-set ReviewAmendments {
+                review-id: review-id,
+                amendment-index: new-update-count,
+            } {
+                old-rating: old-rating,
+                new-rating: new-rating,
+                old-text: old-text,
+                new-text: new-review-text,
+                timestamp: burn-block-height,
+            })
+            (map-set Reviews { review-id: review-id }
+                (merge review {
+                    rating: new-rating,
+                    review-text: new-review-text,
+                    timestamp: burn-block-height,
+                })
+            )
+            (map-set ReviewUpdateHistory { review-id: review-id } {
+                update-count: new-update-count,
+                last-update-block: burn-block-height,
+                original-rating: (get original-rating update-history),
+                previous-rating: old-rating,
+            })
+            (try! (adjust-business-rating-for-update business-id old-rating new-rating))
+            (if (not (is-eq old-rating new-rating))
+                (unwrap-panic (as-contract (ft-transfer? review-token UPDATE-REWARD tx-sender
+                    (get reviewer review)
+                )))
+                false
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-private (adjust-business-rating-for-update
+        (business-id uint)
+        (old-rating uint)
+        (new-rating uint)
+    )
+    (match (map-get? Businesses { business-id: business-id })
+        business (let (
+                (total-ratings (get total-ratings business))
+                (current-avg (get avg-rating business))
+                (rating-sum (* current-avg total-ratings))
+                (adjusted-sum (- rating-sum old-rating))
+                (new-sum (+ adjusted-sum new-rating))
+                (new-avg (if (> total-ratings u0)
+                    (/ new-sum total-ratings)
+                    new-rating
+                ))
+            )
+            (ok (map-set Businesses { business-id: business-id }
+                (merge business { avg-rating: new-avg })
+            ))
+        )
+        ERR-BUSINESS-NOT-FOUND
+    )
+)
+
+(define-read-only (get-review-update-history (review-id uint))
+    (map-get? ReviewUpdateHistory { review-id: review-id })
+)
+
+(define-read-only (get-review-amendment
+        (review-id uint)
+        (amendment-index uint)
+    )
+    (map-get? ReviewAmendments {
+        review-id: review-id,
+        amendment-index: amendment-index,
+    })
+)
+
+(define-read-only (can-update-review (review-id uint))
+    (match (map-get? Reviews { review-id: review-id })
+        review (let ((update-history (default-to {
+                update-count: u0,
+                last-update-block: u0,
+                original-rating: u0,
+                previous-rating: u0,
+            }
+                (map-get? ReviewUpdateHistory { review-id: review-id })
+            )))
+            (some {
+                can-update: (and
+                    (is-eq tx-sender (get reviewer review))
+                    (< (get update-count update-history) MAX-REVIEW-UPDATES)
+                    (>=
+                        (- burn-block-height
+                            (get last-update-block update-history)
+                        )
+                        REVIEW-UPDATE-COOLDOWN
+                    )
+                ),
+                updates-remaining: (- MAX-REVIEW-UPDATES (get update-count update-history)),
+                blocks-until-next-update: (if (>=
+                        (- burn-block-height
+                            (get last-update-block update-history)
+                        )
+                        REVIEW-UPDATE-COOLDOWN
+                    )
+                    u0
+                    (- REVIEW-UPDATE-COOLDOWN
+                        (- burn-block-height
+                            (get last-update-block update-history)
+                        ))
+                ),
+            })
+        )
+        none
+    )
+)
+
+(define-read-only (get-review-rating-changes (review-id uint))
+    (match (map-get? ReviewUpdateHistory { review-id: review-id })
+        history (some {
+            original-rating: (get original-rating history),
+            current-rating: (match (map-get? Reviews { review-id: review-id })
+                review (get rating review)
+                u0
+            ),
+            total-updates: (get update-count history),
+            rating-improved: (>
+                (match (map-get? Reviews { review-id: review-id })
+                    review (get rating review)
+                    u0
+                )
+                (get original-rating history)
+            ),
+        })
+        none
+    )
+)
