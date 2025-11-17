@@ -740,6 +740,55 @@
     )
 )
 
+(define-read-only (get-business-analytics (business-id uint))
+    (match (map-get? Businesses { business-id: business-id })
+        business (let (
+                (reputation (default-to {
+                    reputation-score: u0,
+                    last-updated: u0,
+                    review-velocity: u0,
+                    credibility-score: u0,
+                }
+                    (map-get? BusinessReputation { business-id: business-id })
+                ))
+                (responses (default-to {
+                    total-responses: u0,
+                    average-response-time: u0,
+                    last-response-block: u0,
+                }
+                    (map-get? ResponseMetrics { business-id: business-id })
+                ))
+                (incentives (default-to {
+                    excellence-streak: u0,
+                    last-reward-block: u0,
+                    total-incentives-earned: u0,
+                }
+                    (map-get? BusinessIncentives { business-id: business-id })
+                ))
+                (responsiveness-score (default-to u0 (get-business-responsiveness-score business-id)))
+            )
+            (some {
+                business-id: business-id,
+                owner: (get owner business),
+                name: (get name business),
+                total-ratings: (get total-ratings business),
+                avg-rating: (get avg-rating business),
+                reputation-score: (get reputation-score reputation),
+                review-velocity: (get review-velocity reputation),
+                credibility-score: (get credibility-score reputation),
+                total-responses: (get total-responses responses),
+                average-response-time: (get average-response-time responses),
+                last-response-block: (get last-response-block responses),
+                excellence-streak: (get excellence-streak incentives),
+                last-reward-block: (get last-reward-block incentives),
+                total-incentives-earned: (get total-incentives-earned incentives),
+                responsiveness-score: responsiveness-score,
+            })
+        )
+        none
+    )
+)
+
 (define-constant ERR-ALREADY-VOTED (err u108))
 (define-constant ERR-SELF-VOTE (err u109))
 (define-constant HELPFULNESS-REWARD u3)
